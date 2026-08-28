@@ -46,6 +46,7 @@ export interface Sql {
  */
 const globalRef = globalThis as typeof globalThis & {
   __pgSqlPromise__?: Promise<Sql>;
+  __pgPool__?: import("pg").Pool;
   __pgliteInstance__?: Promise<import("@electric-sql/pglite").PGlite>;
   __pgliteMigrateChain__?: Promise<void>;
 };
@@ -93,7 +94,8 @@ function createNeonSql(): Promise<Sql> {
     types.setTypeParser(OID_INT8, Number);
     types.setTypeParser(OID_DATE, identity);
     types.setTypeParser(OID_INTERVAL, identity);
-    const pool = new Pool({ connectionString: databaseUrl });
+    globalRef.__pgPool__ ??= new Pool({ connectionString: databaseUrl });
+    const pool = globalRef.__pgPool__;
     return toSql(async <T>(text: string, params: unknown[]) => {
       const res = await pool.query(text, params);
       return res.rows as T[];
@@ -194,6 +196,46 @@ export function getSql(): Promise<Sql> {
     throw err;
   });
   return sqlPromise;
+}
+
+/** Run `fn` on a single connection with BEGIN/COMMIT. */
+export async function withTransaction<T>(fn: (sql: Sql) => Promise<T>): Promise<T> {
+  if (typeof window !== "undefined") {
+    throw new Error("@/lib/db is server-only");
+  }
+  if (dbSource === "pglite") {
+    const pg = await getPglite();
+    return pg.transaction(async (tx) => {
+      const sql = toSql(async <R>(text: string, params: unknown[]) => {
+        const result = await tx.query<R>(text, params);
+        return result.rows;
+      });
+      return fn(sql);
+    });
+  }
+  await getSql();
+  const pool = globalRef.__pgPool__;
+  if (!pool) throw new Error("Postgres pool is not initialized");
+  const client = await pool.connect();
+  const sql = toSql(async <R>(text: string, params: unknown[]) => {
+    const res = await client.query(text, params);
+    return res.rows as R[];
+  });
+  try {
+    await client.query("BEGIN");
+    const result = await fn(sql);
+    await client.query("COMMIT");
+    return result;
+  } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch {
+      /* connection already dead */
+    }
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
 /**

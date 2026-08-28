@@ -86,6 +86,13 @@ export const api = {
     call<{ ok: true; agent: string }>("setup", { method: "POST", body: { key, agent } }),
   unlock: (key: string, agent: string) =>
     call<{ ok: true; agent: string }>("unlock", { method: "POST", key, agent }),
+  rotate: (current: string, next: string, agent: string) =>
+    call<{ ok: true; agent: string }>("key/rotate", {
+      method: "POST",
+      key: current,
+      agent,
+      body: { key: next },
+    }),
   files: (
     key: string,
     agent: string,

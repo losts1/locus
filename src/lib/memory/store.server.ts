@@ -1,7 +1,23 @@
 import { getSql, dbSource } from "@/lib/db";
-import { hashKey, newSalt, verifyKey } from "@/lib/memory/crypto.server";
+import {
+  cachedValid,
+  forgetValid,
+  hashKey,
+  keyFingerprint,
+  newSalt,
+  rememberValid,
+  verifyKey,
+} from "@/lib/memory/crypto.server";
 import { HttpError } from "@/lib/memory/errors";
-import { backfillRelated, linkCoSession } from "@/lib/memory/graph.server";
+import {
+  appendDailyTx,
+  backfillRelatedTx,
+  isUniqueViolation,
+  linkCoSessionTx,
+  rotateVaultTx,
+  throttleAuthTx,
+} from "@/lib/memory/mailbox";
+import { assertPath, assertUnchanged, kindFromPath } from "@/lib/memory/path";
 import {
   AGENT_PRESETS,
   type AgentRecord,
@@ -16,7 +32,7 @@ import {
   type VaultStatus,
 } from "@/lib/memory/types";
 
-export { HttpError };
+export { HttpError, assertPath };
 
 const MIN_KEY = 12;
 const MAX_KEY = 128;
@@ -41,6 +57,7 @@ type FileRow = {
   related: string;
   created_at: string | Date;
   updated_at: string | Date;
+  chars_n?: number;
 };
 
 type FactRow = {
@@ -97,7 +114,7 @@ function mapFile(row: FileRow): FileRecord {
     related: row.related,
     createdAt: iso(row.created_at) ?? "",
     updatedAt: iso(row.updated_at) ?? "",
-    chars: row.body.length,
+    chars: row.chars_n ?? row.body.length,
   };
 }
 
@@ -148,55 +165,7 @@ function likeQuery(raw: string): string {
 }
 
 const FILE_SELECT = `path, kind, qmd_type, folder, slug, title, body, summary, tags, assistant, evidence, day, priority, status, access, related, created_at, updated_at`;
-
-export function assertPath(path: string): string {
-  const p = path.trim().replace(/^\/+/, "");
-  const ok =
-    /^(SOUL|USER|MEMORY|HEARTBEAT)\.md$/.test(p) ||
-    /^memory\/INDEX\.qmd$/.test(p) ||
-    /^memory\/\d{4}-\d{2}-\d{2}(?:-[a-z0-9-]+)?\.md$/.test(p) ||
-    /^memory\/(core|sessions|projects|inbox|archive|learner-sessions)\/[a-z0-9][a-z0-9-]{0,80}\.qmd$/.test(
-      p,
-    );
-  if (!ok) throw new HttpError(400, "Path is not a valid ai-memory-system file.");
-  return p;
-}
-
-function kindFromPath(path: string): {
-  kind: FileKind;
-  folder: QmdFolder | null;
-  slug: string | null;
-  qmdType: QmdType | null;
-  day: string | null;
-} {
-  if (path === "SOUL.md") return { kind: "soul", folder: null, slug: null, qmdType: null, day: null };
-  if (path === "USER.md") return { kind: "user", folder: null, slug: null, qmdType: null, day: null };
-  if (path === "MEMORY.md")
-    return { kind: "curated", folder: null, slug: null, qmdType: null, day: null };
-  if (path === "HEARTBEAT.md")
-    return { kind: "heartbeat", folder: null, slug: null, qmdType: null, day: null };
-  const daily = /^memory\/(\d{4}-\d{2}-\d{2})(?:-[a-z0-9-]+)?\.md$/.exec(path);
-  if (daily) return { kind: "daily", folder: null, slug: null, qmdType: null, day: daily[1] };
-  const qmd = /^memory\/(core|sessions|projects|inbox|archive|learner-sessions)\/([a-z0-9-]+)\.qmd$/.exec(
-    path,
-  );
-  if (qmd) {
-    const folder = qmd[1] as QmdFolder;
-    const slug = qmd[2];
-    const typeMap: Record<string, QmdType> = {
-      identity: "identity",
-      people: "person",
-      preferences: "preferences",
-      setup: "setup",
-    };
-    const qmdType: QmdType =
-      folder === "sessions" ? "session" : folder === "projects" ? "project" : (typeMap[slug] ?? "session");
-    return { kind: "qmd", folder, slug, qmdType, day: null };
-  }
-  if (path === "memory/INDEX.qmd")
-    return { kind: "qmd", folder: null, slug: "memory-index", qmdType: "index", day: null };
-  throw new HttpError(400, "Path is not a valid ai-memory-system file.");
-}
+const FILE_LIST_SELECT = `path, kind, qmd_type, folder, slug, title, '' as body, length(body)::int as chars_n, summary, tags, assistant, evidence, day, priority, status, access, related, created_at, updated_at`;
 
 export async function vaultStatus(): Promise<VaultStatus> {
   const sql = await getSql();
@@ -223,8 +192,13 @@ export async function assertKey(key: string | null, agentRaw: string | null): Pr
   );
   const vault = rows[0];
   if (!vault) throw new HttpError(409, "Workspace is not set up yet.");
-  const ok = await verifyKey(key, vault.salt, vault.key_hash);
-  if (!ok) throw new HttpError(401, "Wrong workspace key.");
+  const fp = keyFingerprint(key, vault.salt);
+  if (!cachedValid(fp)) {
+    await throttleAuthTx(sql, "unlock");
+    const ok = await verifyKey(key, vault.salt, vault.key_hash);
+    if (!ok) throw new HttpError(401, "Wrong workspace key.");
+    rememberValid(fp);
+  }
   await touchAgent(agent);
   await ensureBootstrap(agent);
   return agent;
@@ -234,15 +208,36 @@ export async function setupVault(key: string, agentRaw: string | null) {
   requireKeyShape(key);
   const agent = cleanAgent(agentRaw);
   const sql = await getSql();
+  await throttleAuthTx(sql, "setup");
   const existing = await sql.query<{ n: number }>("select count(*)::int as n from locus_vault");
   if ((existing[0]?.n ?? 0) > 0) {
     throw new HttpError(409, "Workspace already has a key. Unlock instead.");
   }
   const salt = newSalt();
   const keyHash = await hashKey(key, salt);
-  await sql.query("insert into locus_vault (id, salt, key_hash) values (1, $1, $2)", [salt, keyHash]);
+  try {
+    await sql.query("insert into locus_vault (id, salt, key_hash) values (1, $1, $2)", [salt, keyHash]);
+  } catch (err) {
+    if (isUniqueViolation(err)) {
+      throw new HttpError(409, "Workspace already has a key. Unlock instead.");
+    }
+    throw err;
+  }
+  rememberValid(keyFingerprint(key, salt));
   await touchAgent(agent);
   await ensureBootstrap(agent);
+  return { ok: true as const, agent };
+}
+
+export async function rotateVault(currentKey: string, nextKey: string, agentRaw: string | null) {
+  requireKeyShape(nextKey);
+  const agent = await assertKey(currentKey, agentRaw);
+  const sql = await getSql();
+  const salt = newSalt();
+  const keyHash = await hashKey(nextKey, salt);
+  await rotateVaultTx(sql, salt, keyHash);
+  forgetValid();
+  rememberValid(keyFingerprint(nextKey, salt));
   return { ok: true as const, agent };
 }
 
@@ -259,10 +254,20 @@ async function putFileRow(file: {
   access?: "public" | "private";
   related?: string;
   qmdType?: QmdType | null;
+  updatedAt?: string;
 }) {
   const path = assertPath(file.path);
   const meta = kindFromPath(path);
   const sql = await getSql();
+  if (meta.kind !== "daily") {
+    const existing = await sql.query<{ updated_at: string | Date }>(
+      "select updated_at from locus_files where path = $1",
+      [path],
+    );
+    if (existing[0]) {
+      assertUnchanged(file.updatedAt, iso(existing[0].updated_at) ?? "");
+    }
+  }
   const body = file.body.slice(0, MAX_BODY);
   const summary = (file.summary ?? body).trim().slice(0, 200);
   await sql.query(
@@ -304,13 +309,14 @@ async function putFileRow(file: {
   return getFile(path);
 }
 
-export async function getFile(path: string): Promise<FileRecord> {
+export async function getFile(path: string, main = true): Promise<FileRecord> {
   const sql = await getSql();
   const rows = await sql.query<FileRow>(`select ${FILE_SELECT} from locus_files where path = $1`, [
     assertPath(path),
   ]);
   const row = rows[0];
   if (!row) throw new HttpError(404, "File not found.");
+  if (!main && row.access === "private") throw new HttpError(404, "File not found.");
   return mapFile(row);
 }
 
@@ -320,6 +326,7 @@ export async function listFiles(opts: {
   q?: string;
   status?: MemoryStatus | "all";
   limit?: number;
+  main?: boolean;
 }): Promise<FileRecord[]> {
   const sql = await getSql();
   const limit = Math.min(Math.max(opts.limit ?? 80, 1), 200);
@@ -351,10 +358,11 @@ export async function listFiles(opts: {
       `(path ilike $${n} or title ilike $${n} or body ilike $${n} or summary ilike $${n} or tags ilike $${n})`,
     );
   }
+  if (opts.main === false) add("access <> ?", "private");
   const where = clauses.length ? `where ${clauses.join(" and ")}` : "";
   params.push(limit);
   const rows = await sql.query<FileRow>(
-    `select ${FILE_SELECT} from locus_files ${where} order by
+    `select ${FILE_LIST_SELECT} from locus_files ${where} order by
        case kind when 'soul' then 0 when 'user' then 1 when 'curated' then 2 when 'heartbeat' then 3 when 'daily' then 4 else 5 end,
        path
      limit $${params.length}`,
@@ -378,6 +386,7 @@ export async function upsertFile(
     priority?: MemoryPriority;
     status?: MemoryStatus;
     access?: "public" | "private";
+    updatedAt?: string;
   },
   agent: string,
 ): Promise<FileRecord> {
@@ -415,39 +424,14 @@ export async function upsertFile(
     status: input.status,
     access: input.access,
     qmdType: input.qmdType,
+    updatedAt: input.updatedAt,
   });
 }
 
 export async function appendDaily(body: string, agent: string, evidence = ""): Promise<FileRecord> {
-  const chunk = body.trim();
-  if (!chunk) throw new HttpError(400, "Nothing to append.");
   const day = todayUtc();
-  const path = `memory/${day}.md`;
-  const stamp = new Date().toISOString().slice(11, 16);
-  const block = `\n\n## ${stamp} UTC — ${displayFor(agent)}\n\n${chunk}\n`;
-  try {
-    const current = await getFile(path);
-    return putFileRow({
-      path,
-      title: current.title,
-      body: (current.body + block).slice(0, MAX_BODY),
-      summary: chunk.slice(0, 200),
-      tags: current.tags,
-      assistant: agent,
-      evidence: evidence || current.evidence,
-    });
-  } catch (err) {
-    if (!(err instanceof HttpError) || err.status !== 404) throw err;
-    return putFileRow({
-      path,
-      title: `Daily log ${day}`,
-      body: `# ${day}\n${block}`,
-      summary: chunk.slice(0, 200),
-      tags: "",
-      assistant: agent,
-      evidence,
-    });
-  }
+  await appendDailyTx(await getSql(), body, agent, displayFor(agent), evidence, day);
+  return getFile(`memory/${day}.md`);
 }
 
 export async function archiveFile(path: string): Promise<void> {
@@ -533,7 +517,7 @@ export async function upsertFact(
        on conflict do nothing`,
       [name, input.sourcePath],
     );
-    await linkCoSession(name, input.sourcePath);
+    await linkCoSessionTx(await getSql(), name, input.sourcePath);
   }
   const rows = await sql.query<FactRow>(
     `select name, summary, content, key_points, assistant, source_path, evidence, created_at, updated_at
@@ -543,10 +527,14 @@ export async function upsertFact(
   return mapFact(rows[0]);
 }
 
-export async function searchHybrid(q: string, limit = 8): Promise<{ files: FileRecord[]; facts: FactRecord[] }> {
+export async function searchHybrid(
+  q: string,
+  limit = 8,
+  main = true,
+): Promise<{ files: FileRecord[]; facts: FactRecord[] }> {
   const query = q.trim();
   if (!query) return { files: [], facts: [] };
-  const files = await listFiles({ q: query, limit });
+  const files = await listFiles({ q: query, limit, main });
   const facts = await listFacts({ q: query, limit });
   return { files, facts };
 }
@@ -582,7 +570,7 @@ export async function learn(agent: string, days = 7): Promise<{ synced: number }
       synced += 1;
     }
   }
-  await backfillRelated();
+  await backfillRelatedTx(sql);
   return { synced };
 }
 
@@ -610,8 +598,8 @@ export async function recall(main = true): Promise<RecallPayload> {
     user: main ? await one("USER.md") : null,
     memory,
     heartbeat: await one("HEARTBEAT.md"),
-    recent: recent.map(mapFile),
-    core: core.map(mapFile),
+    recent: recent.map(mapFile).filter((f) => main || f.access !== "private"),
+    core: core.map(mapFile).filter((f) => main || f.access !== "private"),
     facts,
     agents: await listAgents(),
     generatedAt: new Date().toISOString(),

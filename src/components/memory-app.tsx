@@ -121,6 +121,24 @@ export function MemoryApp({ vaultKey, agent, status, onLock }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  async function selectFile(path: string) {
+    setComposing(false);
+    setSelectedFact(null);
+    try {
+      const { file } = await api.file(vaultKey, agent, path);
+      setFiles((prev) => {
+        const i = prev.findIndex((f) => f.path === file.path);
+        if (i < 0) return [file, ...prev];
+        const next = prev.slice();
+        next[i] = file;
+        return next;
+      });
+      setSelectedPath(file.path);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Could not open file.");
+    }
+  }
+
   const canWrite = nav.id === "daily" || nav.kind === "qmd" || nav.graph;
 
   return (
@@ -291,11 +309,7 @@ export function MemoryApp({ vaultKey, agent, status, onLock }: Props) {
                       key={f.path}
                       file={f}
                       active={selectedPath === f.path}
-                      onClick={() => {
-                        setSelectedPath(f.path);
-                        setSelectedFact(null);
-                        setComposing(false);
-                      }}
+                      onClick={() => void selectFile(f.path)}
                     />
                   ))}
                 </>
@@ -308,10 +322,7 @@ export function MemoryApp({ vaultKey, agent, status, onLock }: Props) {
                   key={f.path}
                   file={f}
                   active={selectedPath === f.path}
-                  onClick={() => {
-                    setSelectedPath(f.path);
-                    setComposing(false);
-                  }}
+                  onClick={() => void selectFile(f.path)}
                 />
               ))
             )}
@@ -359,6 +370,7 @@ export function MemoryApp({ vaultKey, agent, status, onLock }: Props) {
                   title: patch.title,
                   body: patch.body,
                   tags: patch.tags,
+                  updatedAt: selected.updatedAt,
                 });
                 setSelectedPath(file.path);
                 await refresh(nav, query);
