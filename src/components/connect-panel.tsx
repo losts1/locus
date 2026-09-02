@@ -66,12 +66,19 @@ curl -sS "$LOCUS_URL/api/v1/graph/cypher?format=cypher" \\
   -H "X-Locus-Agent: $LOCUS_AGENT" \\
   | cypher-shell -u neo4j
 
-# Push home facts → Locus (last-write-wins on updatedAt)
+# Push home facts → Locus (updatedAt required; last-write-wins)
 curl -sS -X POST "$LOCUS_URL/api/v1/graph/push" \\
   -H "Authorization: Bearer $LOCUS_KEY" \\
   -H "X-Locus-Agent: $LOCUS_AGENT" \\
   -H "Content-Type: application/json" \\
-  -d '{"facts":[{"name":"example","summary":"...","content":"...","updatedAt":"2026-08-27T16:00:00Z"}]}'`,
+  -d '{"facts":[{"name":"example","summary":"...","content":"...","updatedAt":"2026-08-27T16:00:00Z"}]}'
+
+# Rotate workspace key
+curl -sS -X POST "$LOCUS_URL/api/v1/key/rotate" \\
+  -H "Authorization: Bearer $LOCUS_KEY" \\
+  -H "X-Locus-Agent: $LOCUS_AGENT" \\
+  -H "Content-Type: application/json" \\
+  -d '{"key":"new-workspace-key-at-least-12"}'`,
     [origin, publishedHint],
   );
 

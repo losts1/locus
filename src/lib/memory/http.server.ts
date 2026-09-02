@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { parseBoundedInt, parseIsoTime, restPath } from "@/lib/memory/parse";
 import {
   HttpError,
   appendDaily,
@@ -10,6 +11,7 @@ import {
   listFacts,
   listFiles,
   recall,
+  rotateVault,
   searchHybrid,
   setupVault,
   upsertFact,
@@ -64,10 +66,7 @@ function readAgent(request: Request): string | null {
 }
 
 function rest(pathname: string): string {
-  const prefix = "/api/v1/";
-  const i = pathname.indexOf(prefix);
-  const raw = i >= 0 ? pathname.slice(i + prefix.length) : "";
-  return decodeURIComponent(raw.replace(/\/+$/, ""));
+  return restPath(pathname);
 }
 
 const fileWrite = z.object({
@@ -88,6 +87,7 @@ const fileWrite = z.object({
   priority: z.enum(["low", "medium", "high"]).optional(),
   status: z.enum(["active", "completed", "on-hold", "draft", "archived"]).optional(),
   access: z.enum(["public", "private"]).optional(),
+  updatedAt: z.string().max(40).optional(),
 });
 
 const appendSchema = z.object({
@@ -144,6 +144,7 @@ export async function handleLocus(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const path = rest(url.pathname);
     const method = request.method.toUpperCase();
+    const main = url.searchParams.get("main") !== "0";
 
     if (path === "status" && method === "GET") return json(await vaultStatus());
     if (path === "skill" && method === "GET") return text(LOCUS_SKILL);
@@ -154,31 +155,37 @@ export async function handleLocus(request: Request): Promise<Response> {
 
     const agent = await assertKey(readKey(request), readAgent(request));
 
+    if (path === "key/rotate" && method === "POST") {
+      const body = setupSchema.parse(await readJson(request));
+      const current = readKey(request);
+      if (!current) throw new HttpError(401, "Missing workspace key.");
+      return json(await rotateVault(current, body.key, agent));
+    }
     if (path === "unlock" && method === "POST") return json({ ok: true, agent });
     if (path === "heartbeat" && method === "POST") {
       return json({ ok: true, agent, at: new Date().toISOString() });
     }
     if (path === "agents" && method === "GET") return json({ agents: await listAgents() });
     if (path === "recall" && method === "GET") {
-      const main = url.searchParams.get("main") !== "0";
       return json(await recall(main));
     }
     if (path === "search" && method === "GET") {
       const q = url.searchParams.get("q") ?? "";
-      return json(await searchHybrid(q, Number(url.searchParams.get("limit") ?? "8")));
+      return json(await searchHybrid(q, parseBoundedInt(url.searchParams.get("limit"), 8, 1, 200), main));
     }
     if (path === "learn" && method === "POST") {
-      return json(await learn(agent, Number(url.searchParams.get("days") ?? "7")));
+      return json(await learn(agent, parseBoundedInt(url.searchParams.get("days"), 7, 1, 90)));
     }
     if (path === "files" && method === "GET") {
       const filePath = url.searchParams.get("path");
-      if (filePath) return json({ file: await getFile(filePath) });
+      if (filePath) return json({ file: await getFile(filePath, main) });
       const files = await listFiles({
         kind: (url.searchParams.get("kind") as FileKind | "all" | null) ?? "all",
         folder: (url.searchParams.get("folder") as QmdFolder | "all" | null) ?? undefined,
         q: url.searchParams.get("q") ?? undefined,
         status: (url.searchParams.get("status") as MemoryStatus | "all" | null) ?? undefined,
-        limit: Number(url.searchParams.get("limit") ?? "80"),
+        limit: parseBoundedInt(url.searchParams.get("limit"), 80, 1, 200),
+        main,
       });
       return json({ files });
     }
@@ -200,7 +207,7 @@ export async function handleLocus(request: Request): Promise<Response> {
         facts: await listFacts({
           q: url.searchParams.get("q") ?? undefined,
           assistant: url.searchParams.get("assistant") ?? undefined,
-          limit: Number(url.searchParams.get("limit") ?? "40"),
+          limit: parseBoundedInt(url.searchParams.get("limit"), 40, 1, 200),
         }),
       });
     }
@@ -211,10 +218,10 @@ export async function handleLocus(request: Request): Promise<Response> {
     if (path === "traverse" && method === "GET") {
       const start = url.searchParams.get("start") ?? "";
       if (!start) throw new HttpError(400, "start is required.");
-      return json(await traverse(start, Number(url.searchParams.get("depth") ?? "1")));
+      return json(await traverse(start, parseBoundedInt(url.searchParams.get("depth"), 1, 1, 3)));
     }
     if ((path === "graph" || path === "graph/pull") && method === "GET") {
-      return json(await pullGraph(agent, url.searchParams.get("since") ?? undefined));
+      return json(await pullGraph(agent, parseIsoTime(url.searchParams.get("since"))));
     }
     if (path === "graph/push" && method === "POST") {
       const body = pushSchema.parse(await readJson(request));

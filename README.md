@@ -16,7 +16,7 @@ Matches the ai-memory-system file tree:
 | L3 | `memory/{core,sessions,projects,inbox,learner-sessions}/*.qmd` | YAML frontmatter |
 | L4 | Fact graph | `Fact`, `Session`, `LEARNED_IN`, `RELATED_TO`, `Assistant` |
 
-Vector search / FAISS stay on the home box. Neo4j clustering is **not** multi-master (primary → read-only replica). Two-way graph sync is this hub: pull → apply Cypher locally → push. Last-write-wins on `updated_at`.
+Vector search / FAISS stay on the home box. Neo4j clustering is **not** multi-master (primary → read-only replica). Two-way graph sync is this hub: pull → apply Cypher locally → push. Last-write-wins on `updated_at` (SQL on push; Cypher `FOREACH` so a re-apply does not clobber a newer home fact). The Cypher dump is the full graph. Incremental `graph/pull?since=` includes new edges between unchanged facts. Push facts require `updatedAt`. Non-daily file overwrites need the current `updatedAt` or they 409. Daily append is a single SQL concat.
 
 ## Auth
 
@@ -49,8 +49,9 @@ Base: `$LOCUS_URL/api/v1`
 | GET | `/traverse?start=&depth=` | RELATED_TO neighborhood |
 | GET | `/graph/pull?since=` | Pull facts + edges |
 | POST | `/graph/push` | Push facts + RELATED_TO + LEARNED_IN |
-| GET | `/graph/cypher` | Cypher dump for home Neo4j (`?format=cypher` for plain text) |
+| GET | `/graph/cypher` | Full Cypher dump for home Neo4j (`?format=cypher`). LWW apply. |
 | GET | `/graph/stats` | Fact / edge counts and last pull/push per agent |
+| POST | `/key/rotate` | Replace the workspace key (Authorization is the current key) |
 
 ## Home Grok Build
 
